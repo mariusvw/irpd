@@ -1,0 +1,13 @@
+0.13 - initial release
+
+0.14 - made priority requests its own queue
+
+0.15 - fixed a stupid cut and paste bug introduced with the priority request queue.
+
+0.16 - added sample_frequency option for streaming.  added some display options for the cgi.  fixed lame reencoding which was totally b0rked (thanks to Sander for pointing that out).
+
+0.17 - fixed nasty divide by 0 bug that was causing the stream process to crash if irpd could not determine the size of an mp3.
+
+0.18 - allow for comments in playlist.  added server loglevel setting.  better logging.  better handling of 'trouble' mp3s.  also, irpd README claimed to stream to SHOUTcast servers mistakenly...this is false, irpd only supports streaming to icecast servers.
+
+0.20 - made everything perl modules.  made modperl interface.  small bug fixes.

@@ -1,0 +1,25 @@
+This document will explain how to configure the irp CGI interface to run with mod_perl.
+
+I highly recommend using mod_perl as it creates a huge performance increase in the cgi execution.
+
+First, the requirements:
+
+1. Apache.  (I recommend 1.3.12 or later.  i use 1.3.19.)
+2. mod_perl.  (I am using the latest version 1.25.)
+3. some familiarity with configuring apache.
+
+First thing you must do is get Apache running with mod_perl, if you dont have that already.  Once that's done, configuring Apache is fairly easy.
+
+In your Apache configuration file (usually $ServerRoot/conf/httpd.conf), make an entry like this:
+
+<Location /irp>
+   SetHandler perl-script
+   PerlRequire /usr/local/irpd/modperl/startup.pl
+   PerlHandler IRP::Apache
+</Location>
+
+Now, just restart Apache, and use a web browser to request http://yourserver.com/irp and you will have your irp cgi running in mod_perl.
+enjoy.
+
+john@zlilo.com
+May 2, 2001

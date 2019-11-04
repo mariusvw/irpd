@@ -1,0 +1,39 @@
+                                 ZRN IRPD
+      The zlilo.com radio network Internet Radio Protocol Daemon
+John Sachs (john@zlilo.com)                                       3/2/2001
+
+Be sure to read README.
+
+To install irpd, simply copy the contents of this directory to /usr/local/irpd.
+
+Steps:
+1. untar the tarball.
+2. execute install.sh as root.
+(this is a simple three line sh script that creates /usr/local/irpd and copies all files to that new directory - if you already have a /usr/local/irpd, you can just copy everything there by hand, but make sure you get the .irpd_release file)
+Files are:
+zrn-irpd - main script that runs the streamer and the irpd server.
+irpd.conf - configuration file, edit this.
+irp.cgi - CGI interface for the radio station.
+IRP/Commands.pm - perl module containing the subroutines that handle the irpd server commands.
+IRP/Files.pm - perl module with the irp file manipulation routines.
+IRP/Globals.pm - the global variables.
+IRP/Interface.pm - some subroutines to format output for displaying.
+IRP/Apache.pm - the Apache perl module interface to run under mod_perl.
+
+See the README for info on the irpd.conf file, edit that for your purposes, then execute zrn-irpd as root to start up the stream.
+
+Additionally, if you want to install the CGI:
+Either make the /usr/local/irpd directory available to your webserver (with rights to execute CGI's), or better, copy irp.cgi to a location you already have configured.
+
+NEW with version 0.2: apache module using mod_perl
+This has the exact same functionality as the CGI, but I highly recommend you run this as its about 3-4x faster.
+To install this, see README in the modperl directory...its not too hard.
+
+NOTE If you do not install to /usr/local/irpd, you need to edit:
+- zrn-irpd:8,31,32
+- irpd.conf:9
+[if you use the CGI]
+ - irp.cgi:9,20
+[if you use the modperl module]
+ - modperl/startup.pl:2
+ - IRP/Apache.pm:21

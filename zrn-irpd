@@ -1,0 +1,544 @@
+#!/usr/bin/perl -W
+##########################################################################
+#  zrn-irpd                                            John Sachs        #
+#  3/5/2001                                            john@zlilo.com    #
+#       zlilo.com radio network internet radio protocol daemon           #
+#    Released under the GPL  see www.gnu.org for more information        #
+##########################################################################
+use lib qw(/usr/local/irpd);
+
+use IRP::Globals;
+use IRP::Commands;
+use IRP::Files;
+use IRP::Icecast;
+use MP3::Info ();
+use Shout ();
+use Socket; 
+use File::Basename ();
+use Config::IniFiles ();
+
+if ($ARGV[0] && ($ARGV[0] ne '-c')) {
+ die "the only command line flag is -c to give location of config file.";
+}
+
+print "Starting Internet Radio Protocol server.\n";
+
+#configuration items
+my %irpd_ini;
+#if ($ARGV[0] eq '-c') {
+# die "must specify config file with -c flag." unless $ARGV[1];
+# print "Using user specified config file \'$ARGV[1]\'.\n";
+# tie %irpd_ini, 'Config::IniFiles', (-file=>$ARGV[1]) or die "can't open config file $ARGV[1]: $!";
+#} else {
+ print "Using default config file (/usr/local/irpd/irpd.conf).\n";
+ tie %irpd_ini, 'Config::IniFiles', (-file=>"/usr/local/irpd/irpd.conf");
+#}
+
+IRP::Globals::set_globals(%irpd_ini);
+
+my $internal_files_dir = $irpd_ini{'server'}{'prefix'}."/.irpd-internal-files" || '.';
+
+my $version=IRP::Files::get_version();
+my $DEBUG=$irpd_ini{'debug'}{'debug'};
+my $user=$irpd_ini{'server'}{'run_as_user'} || 'nobody'; ## who daemon runs as
+my $log=$irpd_ini{'server'}{'prefix'}."/".
+   $irpd_ini{'server'}{'log_file'}; ## your log file location
+my $enable_skip=$irpd_ini{'server'}{'enable_skip'};
+my $enable_replay=$irpd_ini{'server'}{'enable_replay'};
+my $enable_restart=$irpd_ini{'server'}{'enable_restart'};
+my $enable_randomize_requests=$irpd_ini{'server'}{'enable_rand'};
+my $enable_requests=$irpd_ini{'server'}{'enable_requests'};
+my $enable_prequests=$irpd_ini{'server'}{'enable_priority_requests'};
+my $port=$irpd_ini{'server'}{'port'};
+my $loglevel=$irpd_ini{'server'}{'loglevel'} || 1;
+my $banner=$irpd_ini{'server'}{'banner'};
+my $prompt=$irpd_ini{'server'}{'prompt_char'};
+my $interface=$irpd_ini{'server'}{'interface'} || '127.0.0.1'; ## bind to
+my $playlist = $irpd_ini{'files'}{'playlist'};
+
+my $iceserver = $irpd_ini{'icecast'}{'server'};
+my $iceport = $irpd_ini{'icecast'}{'port'};
+my $mountpoint = $irpd_ini{'icecast'}{'mountpoint'};
+my $password = $irpd_ini{'icecast'}{'password'};
+my $icename = $irpd_ini{'icecast'}{'name'};
+my $url = $irpd_ini{'icecast'}{'url'};
+my $genre = $irpd_ini{'icecast'}{'genre'};
+my $public = $irpd_ini{'icecast'}{'public'};
+my $bitrate = $irpd_ini{'icecast'}{'bitrate'};
+my $sample_freq = $irpd_ini{'icecast'}{'sample_frequency'};
+my $reencode = $irpd_ini{'icecast'}{'reencode'};
+my $reencoder=$irpd_ini{'icecast'}{'reencoder'};
+
+untie %irpd_ini;
+## end of configuration stuff
+
+#if (($> != $user) && ($> != 0 && $< != 0)) {
+# print "You must be root to run IRPD.\n";
+# exit;
+#}
+
+$SIG{CHLD}='IGNORE';
+
+server();
+
+sub CLOSE_socket {
+ print "\nServer killed, shutting down...\n";
+ &log("Server killed, irpd shutting down...");
+ ##rm current song file to show that server is down##
+ unlink $IRP::Globals::GLOBAL_current_song;
+ print STDOUT "Shutting down socket...";
+ close(SERVER);
+ shutdown(SERVER, 2);
+ print STDOUT "done.\n";
+ #close $client or print "close client: $!\n";
+ die "Server exiting";
+}
+
+sub server {
+ $SIG{INT} = 'IGNORE' unless $DEBUG;
+
+ print "Setting up socket...";
+ $interface=pack('C4',split('.',$interface));
+ $AF_INET = 2;
+ $SOCK_STREAM = 1;
+ #$IPPROTO_TCP = 6;
+ $sockaddr = 'S n a4 x8';
+ #$proto=$IPPROTO_TCP;
+ $local_addr = sockaddr_in( $port, INADDR_ANY);
+ $trans_serv= getprotobyname( 'tcp' );
+ socket(SERVER, AF_INET, SOCK_STREAM, $trans_serv)
+ #socket(SERVER, $AF_INET, $SOCK_STREAM, $proto)
+  || die "\ndied at socket: $!";
+ #setsockopt(SERVER, 0xffff, 0x0004, "1")
+ setsockopt(SERVER, SOL_SOCKET, SO_REUSEADDR, "1")
+  && die "\ndied at setsockopt: $!";
+ #bind(SERVER, pack ($sockaddr, 2, $port, $interface))
+ bind(SERVER, $local_addr)
+  || die "\ndied at binding: $!"; # address or 0 for any
+ listen(SERVER,128)
+  || die "\ndied at listen: $!"; # maxcon=128
+ print "done.\n";
+
+ if ($internal_files_dir ne '.' && !-e $internal_files_dir) {
+  mkdir $internal_files_dir, 0700 or die "cant create $internal_files_dir as user $user: $!"; 
+  &log("created directory $internal_files_dir");
+ }
+ if (!-e $log) {
+  open(LOG,">$log") or die "cant create $log: $!";
+  close(LOG);
+ }
+
+ my $client='aaaa';
+ if($user) {
+  #local($name,$passwd,$uid,$gid,$quota,$comment,$gcos,$dir,$shell,$expire) = getpwnam $user;
+  my @user = getpwnam $user;
+  my ($uid, $gid) = ($user[2], $user[3]);
+  local $you = getpwuid $>;
+  chown $uid, $gid, $internal_files_dir if $internal_files_dir ne '.';
+  chown $uid, $gid, $log;
+
+  if (($you ne $user) && ($> != 0)) {
+   print STDERR "you are \'$you\' trying to run as \'$user\'.  Can't let you do that...shutting down.\n";
+   exit;
+  }
+  &log("IRPD Server v$version starting up.");
+  &log("logging at level $loglevel");
+  &log("Moving to user $user uid=$uid gid=$gid");
+  print STDERR "moving to user $user ($uid:$gid)\n" if $DEBUG;
+  ($>,$))=($uid,$gid);
+  ($<,$()=($uid,$gid);
+ }
+
+ print "Creating internal playlist (prefix \'$internal_files_dir\')...";
+ my $numsongs = IRP::Files::create_internal_playlist_file($playlist);
+ print "done ($numsongs songs).\n";
+ 
+ die "fork: $!" if (!defined($pid = fork));
+ if ($pid) {
+  #stream process
+  &log("starting stream process...");
+ 
+  print "Connecting to icecast server at \'$iceserver\'...";
+  if (substr($mountpoint, 0, 1) ne '/') {
+   $mountpoint = '/'.$mountpoint;
+  }
+  my $conn = new Shout
+     ip              => $iceserver,
+     port            => $iceport,
+     mount           => $mountpoint,
+     password        => $password,
+     icy_compat      => 0,
+     dumpfile        => undef,
+     name            => $icename,
+     url             => $url,
+     genre           => $genre,
+     description     => '',
+     ispublic        => $public;
+ 
+  $conn->connect || die "Failed to connect to icecast server: ", $conn->error;
+  print "done.\n";
+  &log("Connected to icecast server at $iceserver"); 
+
+  if (!$DEBUG) {
+   $pid = undef;
+   die "fork: $!" if (!defined($pid = fork));
+   if ($pid) {
+    print "Lights out, going to the background...\n";
+    &log("Going to the background.");
+    exit;
+   }
+  }
+
+  my ($buffer, $bytes) = ('',0);
+  my $playlist_data = '';
+ 
+  while (1) {
+   my $needs_to_be_reencoded = 0;
+
+   my $song = IRP::Files::get_next_song(); 
+   &log("got next song $song", 2);
+   my ($request, $id);
+   if ($song =~ /^([01])[$IRP::Globals::GLOBAL_delim](\d+)[$IRP::Globals::GLOBAL_delim](.*)$/) {
+    $request = $1;
+    $id = $2;
+    $song = $3;
+   }
+
+   unless (-e $song) {
+    &log("bad song [$id] $song", 1);
+    # should delete song from playlist here? #
+    next;
+   }
+ 
+   my $stream_bitrate = $bitrate;
+   my $file_bitrate;
+   my $info = MP3::Info::get_mp3info($song);# or die "cant get info for $song: $!";
+   if ($@) {
+    &log("warning: unable to open $song");
+    print STDERR "STREAM: unable to open file \'$song\': $!\n";
+    next;
+   }
+   $file_bitrate = $info->{BITRATE};
+
+   if ($file_bitrate != $stream_bitrate) {
+    if ($reencode) {
+     $needs_to_be_reencoded = 1;
+    } else {
+     &log("skipping $song - bitrates do not match and reencoding net set.");
+     print STDERR "STREAM: bitrates do not match, reencoding not set, skipping song.\n" if $DEBUG;
+     next;
+    }
+   }
+ 
+   my $metadata = File::Basename::basename($song);
+   my $id3 = MP3::Info::get_mp3tag($song);
+   $metadata = "$id3->{ARTIST} - $id3->{TITLE}" if ($id3);
+ 
+   print STDERR "STREAM: setting bitrate to $stream_bitrate.\n" if $DEBUG;
+   $conn->bitrate($stream_bitrate);
+   print STDERR "STREAM: setting metadata to $metadata.\n" if $DEBUG;
+   &log("setting metadata to \'$metadata\'", 2);
+   $conn->updateMetadata($metadata);
+ 
+   my $stream_song = $song;
+   if ($needs_to_be_reencoded) {
+    ##lame##
+    if ($reencoder eq 'lame') {
+     print STDERR "STREAM: using $reencoder to reencode.\n" if $DEBUG;
+     $stream_song = "lame --mp3input -f -b $stream_bitrate -s $sample_freq \"$song\"";
+     $stream_song .= ' - 2>/dev/null |';
+    } elsif ($reencoder eq 'gogo') {
+    ##gogo##
+     print STDERR "STREAM: using $reencoder to reencode.\n" if $DEBUG;
+     $stream_song = "mpg123 -sq \"$song\" 2>/dev/null |";
+     $stream_song .= "gogo stdin /dev/stdout -silent -m j -d $sample_freq -b $stream_bitrate -offset 0";
+     $stream_song .= " 2>/dev/null |";
+    } else {
+     print STDERR "IRPD WARNING: \'$reencoder\' is an unsupported encoder type!  streaming song without reencoding...it will be bad...\n";
+     &log("warning: unsupported reencoder \'$reencoder\'...not using.");
+    }
+ 
+    print STDERR "STREAM: reencoding using command:\n$stream_song\n" if $DEBUG;
+    &log("re-encoding $song with \'$stream_song\'", 2);
+   }
+ 
+   IRP::Files::set_current_song($request, $id, $song, '0.00');
+   ## moving this to the end...will only count the song if it finishes ##
+   ## IRP::Files::count_song($IRP::Globals::GLOBAL_play_count, $song);
+   ##
+   my @info = stat($song);
+   open (SONG, $stream_song);
+ 
+   my ($read, $buff, $sleeptime);
+   my $bufcount = 0;
+   my $pfsize = $info[7];
+
+   ##deal with 0 $pfsize##
+   if (!$pfsize) {
+    &log("not good: \$pfsize has bad value for $song!", 2);
+    if ($info->{SIZE}) {
+     $pfsize = $info->{SIZE};
+     &log("warning: attempting to use mp3info size of \'$pfsize\'", 2);
+    } else {
+     &log("NOT GOOD: $song has no info i can get to.  this can only be bad so i'm skipping.");
+     ## possibly delete the song from the playlist here? ##
+     next;
+    }
+   }
+
+   my $skipped_current_song = 0;
+   while ( ($bytes = sysread(SONG, $buffer, 4096 )) > 0 ) {
+
+    ##calculate percentage done##
+    $bufcount++;
+    ##adjusts for reencoding songs##
+    if ($needs_to_be_reencoded && $bufcount == 1 && $info->{BITRATE}) {
+     print STDERR "STREAM: adjusting for reencoding ($stream_bitrate/".$info->{BITRATE}." = ".$stream_bitrate/$info->{BITRATE}.")\n" if $DEBUG;
+     &log("adjusting percent calculation for re-encoding: ($stream_bitrate/".$info->{BITRATE}." = ".$stream_bitrate/$info->{BITRATE}.")", 2);
+     $pfsize = $pfsize*($stream_bitrate/$info->{BITRATE});
+    }
+    my $percent_done = 0.01;
+    $percent_done = (($bufcount*4096)/$pfsize)*100 unless $pfsize == 13;
+    $percent_done = sprintf("%.2f", $percent_done);
+    print STDERR "BUFFER: $bufcount DONE: $percent_done\%\n" if $DEBUG>2;
+    ##sanity checking (allow 2% since last buffer may not be full##
+    if ($percent_done > 102.00) {
+     &log("warning: $song hit $percent_done\% skipping.");
+     ($buffer, $bytes) = ('',0);
+     last;
+    }
+    IRP::Files::set_current_song($request, $id, $song, $percent_done);
+
+    ##check for skip##
+    if (-e $IRP::Globals::GLOBAL_skip_current_file) {
+     &log("skipping $song", 2);
+     print STDERR "STREAM: skip file exists, skipping current.\n" if $DEBUG;
+     $skipped_current_song = 1;
+     unlink $IRP::Globals::GLOBAL_skip_current_file;
+     ($buffer, $bytes) = ('',0);
+     last;
+    }
+    ##check for restart##
+    if (-e $IRP::Globals::GLOBAL_restart_current_file) {
+     &log("restarting $song", 2);
+     print STDERR "STREAM: restart file exists, restarting current.\n" if $DEBUG;
+     unlink $IRP::Globals::GLOBAL_restart_current_file;
+     if ($needs_to_be_reencoded) {
+     # for some reason seek(SONG,0,0) was not working here.
+      close(SONG);
+      open(SONG,$stream_song);
+     }
+     $bufcount = 0;
+     next;
+    }
+ 
+    $conn->sendData($buffer) && next;
+    print STDERR "STREAM: send error: ", $conn->error, "\n";
+    last;
+   } continue {
+    $conn->sleep;
+   }
+   close(SONG);
+   ## only counting song now if it finishes playing
+   ## skipped songs wont get counted.
+   if (!$skipped_current_song) {
+    IRP::Files::add_history($id, $song);
+    IRP::Files::count_song($IRP::Globals::GLOBAL_play_count, $song);
+   }
+  }
+ 
+  $conn->disconnect;
+  exit(0);
+
+ } else {
+  #playlist process
+  $SIG{TERM} = \&CLOSE_socket;
+  $SIG{KILL} = \&CLOSE_socket;
+  $SIG{INT} = \&CLOSE_socket if $DEBUG;
+
+  &log("server accepting connections.");
+  while($from=accept(++$client,SERVER)) {
+   my ($sa, $n2, $p, $f) = unpack($sockaddr,$from);
+   $from=join('.', unpack("x4 C4",$from));
+   &log("Connection on $client from $from");
+   &handle($client) unless fork;
+   close($client);
+  }
+ }
+}
+ 
+sub handle { local($client)=@_; 
+ print STDERR "[handle]got new connection from $from on $client\n" if $DEBUG;
+ select $client unless $client eq 'STDIN';
+ $|=1; # make unbuffered
+ &sp($from);
+ &log("Client connection $client closed.");
+ close($client);
+ exit;
+}
+ 
+sub sp { local($ip) = @_;
+#print "Hello [$ip].\n";
+#local(@p,$from,$to,@a,$adr,$arg,$header,$hdone,$relay,$helo,%qfile,%maildir);
+
+print "ZRN IRPD server $version ($banner)\n$prompt ";
+while(<$client>) {
+ #print DEBUG "$ip:$_";
+ s/\s+/ /g;
+ s/^ //; s/ $//;
+ print STDERR "[sp]$client($ip) issued command \'$_\'\n" if $DEBUG;
+ my @cmd=split(' ',$_);
+# ($adr)=/<([^>]+)>/;
+# $arg=shift(@p); $arg="\L$arg";
+# my @cmd = split(/\s+/, $arg);
+
+ unless (defined($cmd[0])) {
+  print "$prompt ";
+  next;
+ }
+
+ if($cmd[0] eq 'help' || $cmd[0] eq '?') {
+  print STDERR "[sp]showing help to $client.\n" if $DEBUG;
+  #print "cmd[0]=$cmd[0]  cmd[1]=$cmd[1]\r\n";
+  print IRP::Commands::show_help($cmd[1]);
+ } elsif ($cmd[0] eq 'skip') {
+  if ($enable_skip) {
+   &log("Client at $ip issued skip");
+   IRP::Commands::skip_current();
+   print "STATUS: SKIPPED.\n";
+  } else {
+   &log("Client at $ip attempted skip (disabled)");
+   print "STATUS: NOT SKIPPED. (Skip disabled)\n";
+  }
+ } elsif ($cmd[0] eq 'restart') {
+  if ($enable_restart) {
+   &log("Client at $ip issued restart");
+   IRP::Commands::restart_current();
+   print "STATUS: RESTARTED.\n";
+  } else {
+   &log("Client at $ip attempted restart (disabled)");
+   print "STATUS: NOT RESTARTED. (Restart disabled)\n";
+  }
+ } elsif ($cmd[0] eq 'replay') {
+  my ($requested, $id, $perc, $file);
+  if ($enable_replay) {
+   ($requested, $id, $perc, $file) = IRP::Files::get_current_info();
+   &log("$client($ip) replaying $id$IRP::Globals::GLOBAL_delim$file after $perc\%");
+   print IRP::Commands::add_request($id, 1);
+  } else {
+   &log("$client($ip) attempted replay of $id$IRP::Globals::GLOBAL_delim$file after $perc\% (replay disabled)");
+   print "STATUS: NOT REQUESTED. (Replay disabled)\n";
+  }
+ } elsif ($cmd[0] eq 'prequest' || $cmd[0] eq 'preq' || $cmd[0] eq 'pr') {
+  if ($enable_requests && $enable_prequests) {
+   if (!$cmd[1]) {
+    print IRP::Commands::show_help('request');
+   } else {
+    print STDERR "[sp]requesting $cmd[1] for $client.\n" if $DEBUG;
+    &log("$client($ip) adding priority request for song id $cmd[1].");
+    print IRP::Commands::add_request($cmd[1], 1);
+   }
+  } else {
+   &log("$client($ip) attempted priority request for song id $cmd[1].");
+   print "STATUS: NOT REQUESTED. (Requests disabled)\n" unless $enable_requests;
+   print "STATUS: NOT REQUESTED. (Priority requests disabled)\n" if ($enable_requests && !$enable_prequests);
+  }
+ } elsif ($cmd[0] eq 'request' || $cmd[0] eq 'req' || $cmd[0] eq 'r') {
+  if ($enable_requests) {
+   if (!$cmd[1]) {
+    print IRP::Commands::show_help('request');
+   } else {
+    print STDERR "[sp]requesting $cmd[1] for $client.\n" if $DEBUG;
+    &log("$client($ip) requesting song id $cmd[1].");
+    print IRP::Commands::add_request($cmd[1]);
+   }
+  } else {
+   &log("$client($ip) attemped to request song id $cmd[1]. (disabled)");
+   print "STATUS: NOT REQUESTED. (Requests disabled)\n";
+  }
+ } elsif ($cmd[0] eq 'current') {
+  print STDERR "[sp]showing current song to $client.\n" if $DEBUG;
+  my $cur_str = IRP::Commands::show_current();
+  print $cur_str;
+ } elsif ($cmd[0] eq 'info') {
+  print STDERR "[sp]showing song info ($cmd[1]) to $client.\n" if $DEBUG;
+  if (defined($cmd[1])) {
+   my $info = IRP::Commands::show_info($cmd[1]);
+   print $info;
+  } else {
+   print "Must specify song ID.\r\n";
+  }
+ } elsif ($cmd[0] eq 'playlist' || $cmd[0] eq 'songs' ||
+          $cmd[0] eq 'requests' || $cmd[0] eq 'skips' ||
+          $cmd[0] eq 'history') {
+  print STDERR "[sp]showing \'$cmd[0]\' list to $client.\n" if $DEBUG;
+  my $show = IRP::Commands::show_list($cmd[0]);
+  print $show;
+ } elsif ($cmd[0] eq 'list') {
+  print STDERR "[sp]showing \'$cmd[1]\' list to $client.\n" if $DEBUG;
+  my $show = IRP::Commands::show_list($cmd[1]);
+  print $show;
+ } elsif ($cmd[0] eq 'skipped' || $cmd[0] eq 'played' || $cmd[0] eq 'requested') {
+  print STDERR "[sp]showing top 10 \'$cmd[0]\' to $client.\n" if $DEBUG;
+  print IRP::Commands::show_top(10, 'skips') if $cmd[0] eq 'skipped';
+  print IRP::Commands::show_top(10, 'songs') if $cmd[0] eq 'played';
+  print IRP::Commands::show_top(10, 'requests') if $cmd[0] eq 'requested';
+ } elsif ($cmd[0] eq 'top') {
+  if (!$cmd[1]) {
+   print IRP::Commands::show_help('top');
+  } elsif (!$cmd[1] =~ /^\d+$/) {
+   print "First argument to \'top\' must be numeric.\n";
+  } elsif ($cmd[2] && ($cmd[2] ne 'skips' && $cmd[2] ne 'requests' && $cmd[2] ne 'songs')) {
+   print "Second argument to \'top\' must be either \'skips\', \'requests\', or \'songs\'.\n";
+  } else {
+   print STDERR "[sp]calling show_top with args $cmd[1] and $cmd[2]\n" if $DEBUG;
+   print IRP::Commands::show_top($cmd[1], $cmd[2]);
+  }
+ } elsif ($cmd[0] eq 'reload') {
+  print STDERR "[sp]reloading playlist for $client.\n" if $DEBUG;
+  #reload_playlist();
+  my $num = IRP::Files::create_internal_playlist_file($playlist);
+  print "reloaded $num songs.\n";
+ } elsif ($cmd[0] eq 'rand' || $cmd[0] eq 'randomize') {
+  if ($enable_randomize_requests) {
+   &log("$client($ip) randomizing request queue.");
+   IRP::Commands::rand_requests();
+   print IRP::Commands::show_list('requests');
+  } else {
+   &log("$client($ip) attempted $cmd[0] (disabled)");
+   print "STATUS: NOT RANDOMIZED. (Disabled)\n";
+  }
+ #} elsif ($cmd[0] eq 'auth') {
+ # print STDERR "[sp]attempting to authenticate $client.\n" if $DEBUG;
+ # &log("Attempting to authenticate client at $ip");
+ # IRP::Commands::auth($ip);
+ } elsif ($cmd[0] eq 'who') {
+  print STDERR "[sp]checking icecast to see who is listening.\n" if $DEBUG;
+  print (&IRP::Icecast::icecast('who'));
+ } elsif ($cmd[0] eq 'uptime') {
+  print STDERR "[sp]checking icecast uptime.\n" if $DEBUG;
+  print (&IRP::Icecast::icecast('uptime'));
+ } elsif ($cmd[0] eq 'quit' || $cmd[0] eq 'exit') {
+  print STDERR "[sp]closing connection to $client.\n" if $DEBUG;
+  &log("$ip disconnecting from $client");
+  print "ZRN IRPD disconnecting.\r\n";
+  return;
+ } else {
+  print STDERR "[sp]invalid command.\n" if $DEBUG;
+  print "Command not recognized.\r\n";
+ }
+ print "$prompt ";
+} 
+}
+
+sub log {
+ my $log_string = shift;
+ my $log_level = shift || 1;
+ return unless $log_level <= $loglevel;
+ local($time);
+ $time=localtime;
+ open(LOG,">>$log") or print STDERR "irpd warning: can't open log $log: $!\n";
+ print LOG "$time:IRPD: $log_string\n";
+ close(LOG);
+}
+

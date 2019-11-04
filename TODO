@@ -1,0 +1,8 @@
+- authentication [coming with apache 2.0 - irpd will be its own protocol module in apache 2.0]
+- playlist delete
+- allow delete from the request queue
+- maybe reset stats
+- optimize the cgi [the modperl version is now much better.  will still get better.]
+- add more formatting options to cgi
+- option to hide/show full mp3 file path
+- timeout and close idle connections

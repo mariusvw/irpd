@@ -1,1 +1,1 @@
-# irpd
+# irpd (Internet Radio Protocol Daemon)
